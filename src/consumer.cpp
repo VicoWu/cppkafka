@@ -49,20 +49,33 @@ using std::allocator;
 
 namespace cppkafka {
 
+/**
+ * 发生rebalance时候的回调函数
+ * 调用者是 rd_kafka_poll_cb
+ */
 void Consumer::rebalance_proxy(rd_kafka_t*, rd_kafka_resp_err_t error,
                                rd_kafka_topic_partition_list_t *partitions, void *opaque) {
     TopicPartitionList list = convert(partitions);
     static_cast<Consumer*>(opaque)->handle_rebalance(error, list);
 }
 
+/**
+ * 创建一个Consumer对象，调用者是 KafkaConsumer::createConsumer
+ * @param config
+ */
 Consumer::Consumer(Configuration config)
 : KafkaHandleBase(move(config)) {
     char error_buffer[512];
-    rd_kafka_conf_t* config_handle = get_configuration_handle();
+    rd_kafka_conf_t* config_handle = get_configuration_handle(); // 在这里设置了自己的opaque_handle
     // Set ourselves as the opaque pointer
-    rd_kafka_conf_set_opaque(config_handle, this);
-    rd_kafka_conf_set_rebalance_cb(config_handle, &Consumer::rebalance_proxy);
-    rd_kafka_t* ptr = rd_kafka_new(RD_KAFKA_CONSUMER,
+    // 将当前的CPPKafka绑定到当前创建的rd_kafka_conf_t对象中，相当于绑定到了即将创建的rd_kafka_t上面
+    rd_kafka_conf_set_opaque(config_handle, this); // 将opaque设置为当前的Consumer对象
+    /**
+     * 在构造Consumer的时候，这里设置了rebalance_callback，同时在上层调用者KafkaConsumer::createConsumer调用的时候，
+     * 设置了assignment, revoke和rebalance_error callback。 但是在Consumer析构的时候，只是先将assignment, revoke和rebalance_error callback给设置为0了
+     */
+    rd_kafka_conf_set_rebalance_cb(config_handle, &Consumer::rebalance_proxy); // 设置了rebalance的callback
+    rd_kafka_t* ptr = rd_kafka_new(RD_KAFKA_CONSUMER, //构造一个 rd_kafka_t对象
                                    rd_kafka_conf_dup(config_handle),
                                    error_buffer, sizeof(error_buffer));
     if (!ptr) {
@@ -72,14 +85,18 @@ Consumer::Consumer(Configuration config)
     set_handle(ptr);
 }
 
+/**
+ * 在析构以前，会调用 moveConsumer() 进行订阅取消的操作，
+ * 所以在调用moveConsumer()进行unsubscribe以前还没有清空assignment_callback, revocation_callback和rebalance_error_callback
+ */
 Consumer::~Consumer() {
     try {
         // make sure to destroy the function closures. in case they hold kafka
         // objects, they will need to be destroyed before we destroy the handle
-        assignment_callback_ = nullptr;
-        revocation_callback_ = nullptr;
-        rebalance_error_callback_ = nullptr;
-        close();
+        assignment_callback_ = nullptr; // 不再处理 assignment_callback
+        revocation_callback_ = nullptr; // 不再处理 assignment_callback
+        rebalance_error_callback_ = nullptr; // 不再处理 rebalance_error_callback
+        close(); // 在这里发生阻塞
     }
     catch (const HandleException& ex) {
         ostringstream error_msg;
@@ -98,10 +115,19 @@ Consumer::~Consumer() {
     }
 }
 
+/**
+ * 调用者 是 void KafkaConsumer::createConsumer
+ * 原生的rdkafka不支持独立的assignment callback，只支持独立的rebalance callback
+ * @param callback
+ */
 void Consumer::set_assignment_callback(AssignmentCallback callback) {
     assignment_callback_ = move(callback);
 }
 
+/**
+ * 调用者是 void KafkaConsumer::createConsumer
+ * 原生的rdkafka不支持独立的assignment callback，只支持独立的rebalance callback
+ */
 void Consumer::set_revocation_callback(RevocationCallback callback) {
     revocation_callback_ = move(callback);
 }
@@ -124,16 +150,17 @@ void Consumer::unsubscribe() {
 
 void Consumer::assign(const TopicPartitionList& topic_partitions) {
     rd_kafka_resp_err_t error;
-    TopicPartitionsListPtr topic_list_handle = convert(topic_partitions);
+    TopicPartitionsListPtr topic_list_handle = convert(topic_partitions);  // 将cppkafka的消息转换成底层librdkafka的消息
     error = rd_kafka_assign(get_handle(), topic_list_handle.get());
     check_error(error, topic_list_handle.get());
 }
 
-void Consumer::unassign() {
+void Consumer::unassign() { // 在这里处理rd_kafka的unassign的消息
     rd_kafka_resp_err_t error = rd_kafka_assign(get_handle(), nullptr);
     check_error(error);
 }
 
+// 暂停消息消费
 void Consumer::pause() {
     pause_partitions(get_assignment());
 }
@@ -284,14 +311,28 @@ Queue Consumer::get_consumer_queue() const {
     return Queue::make_queue(rd_kafka_queue_get_consumer(get_handle()));
 }
 
+/**
+从一个特定的 topic-partition 拿一个专属的本地 queue，让你可以单独对这个 partition 消费消息。
+
+为什么 disable forwarding？
+        要保证这部分消息只存在于这个queue里，不会被自动转发到全局的 consumer queue 里，否则你就拿不到了。
+ * @param partition
+ * @return
+ */
 Queue Consumer::get_partition_queue(const TopicPartition& partition) const {
-    Queue queue = Queue::make_queue(rd_kafka_queue_get_partition(get_handle(),
-                                                                 partition.get_topic().c_str(),
-                                                                 partition.get_partition()));
+    Queue queue = Queue::make_queue(rd_kafka_queue_get_partition(get_handle(), // 底层的Consumer句柄
+                                                                 partition.get_topic().c_str(), //topic
+                                                                 partition.get_partition()));// partition id
+    // 禁用 queue forwarding。
+    // 默认 Kafka C 客户端内部会把不同 partition 的消息转发（forward）到主 consumer queue 里，这样 consumer.poll() 只从主 queue 拉就行了。
+    // 但是如果你要单独处理 partition queue，就需要 关掉转发（forwarding）功能，不然消息会被拉到主queue，不在这个单独partition queue里了！
     queue.disable_queue_forwarding();
     return queue;
 }
 
+/**
+ * 在 Consumer::~Consumer() 中被调用
+ */
 void Consumer::close() {
     rd_kafka_resp_err_t error = rd_kafka_consumer_close(get_handle());
     check_error(error);
@@ -316,15 +357,25 @@ void Consumer::commit(const TopicPartitionList* topic_partitions, bool async) {
     }
 }
 
+/**
+ * callback调用
+ * @param error
+ * @param topic_partitions 会进行全量分配的TopicPartition，而不是增量的TopicPartition
+ * @return
+ */
+
 void Consumer::handle_rebalance(rd_kafka_resp_err_t error,
                                 TopicPartitionList& topic_partitions) {
-    if (error == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS) {
+    // 调用assignment callback，但是在Consumer::~Consumer的析构发生的时候，第一步就是已经把assignment callback清空了，因此这个assignment callback时间上已经为空了
+    if (error == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS) { // 为什么这里里叫做error？里的error只是发生了rebalance以后的操作的分类，比如是assign还是unassign等
         CallbackInvoker<AssignmentCallback>("assignment", assignment_callback_, this)(topic_partitions);
-        assign(topic_partitions);
+        // 尽管没有用户自定义的assignment callback，但是主assignment流程还是会执行
+        assign(topic_partitions); // 这里会调用 rd_kafka_assign
     }
-    else if (error == RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS) {
+    // 调用assignment callback，但是在Consumer::~Consumer的析构发生的时候，第一步就是已经把assignment callback清空了，因此这个assignment callback时间上已经为空了
+    else if (error == RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS) { // 为什么这里里叫做error？这里的error只是发生了rebalance以后的操作的分类，比如是assign还是unassign等
         CallbackInvoker<RevocationCallback>("revocation", revocation_callback_, this)(topic_partitions);
-        unassign();
+        unassign(); // 这里会调用 rd_kafka_assign
     }
     else {
         CallbackInvoker<RebalanceErrorCallback>("rebalance error", rebalance_error_callback_, this)(error);

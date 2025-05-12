@@ -56,7 +56,10 @@ KafkaHandleBase::KafkaHandleBase(Configuration config)
         rd_kafka_conf_set_default_topic_conf(config_.get_handle(), conf_handle);
     }
 }
-
+/**
+ * 暂停这个tp的消息消费
+ * @param topic_partitions
+ */
 void KafkaHandleBase::pause_partitions(const TopicPartitionList& topic_partitions) {
     TopicPartitionsListPtr topic_list_handle = convert(topic_partitions);
     rd_kafka_resp_err_t error = rd_kafka_pause_partitions(get_handle(), 
