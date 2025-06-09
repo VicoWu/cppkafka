@@ -151,12 +151,12 @@ void Consumer::unsubscribe() {
 void Consumer::assign(const TopicPartitionList& topic_partitions) {
     rd_kafka_resp_err_t error;
     TopicPartitionsListPtr topic_list_handle = convert(topic_partitions);  // 将cppkafka的消息转换成底层librdkafka的消息
-    error = rd_kafka_assign(get_handle(), topic_list_handle.get());
+    error = rd_kafka_assign(get_handle(), topic_list_handle.get()); // 都是调用 rd_kafka_assign，由于是全量的，因此assign和unassign都是相同的处理逻辑
     check_error(error, topic_list_handle.get());
 }
 
 void Consumer::unassign() { // 在这里处理rd_kafka的unassign的消息
-    rd_kafka_resp_err_t error = rd_kafka_assign(get_handle(), nullptr);
+    rd_kafka_resp_err_t error = rd_kafka_assign(get_handle(), nullptr); // 由于是全量的，因此unassign全部的意思，就是assign nothing
     check_error(error);
 }
 
@@ -332,6 +332,7 @@ Queue Consumer::get_partition_queue(const TopicPartition& partition) const {
 
 /**
  * 在 Consumer::~Consumer() 中被调用
+ * 搜索  rd_kafka_resp_err_t rd_kafka_consumer_close(
  */
 void Consumer::close() {
     rd_kafka_resp_err_t error = rd_kafka_consumer_close(get_handle());
@@ -358,7 +359,7 @@ void Consumer::commit(const TopicPartitionList* topic_partitions, bool async) {
 }
 
 /**
- * callback调用
+ * callback调用，注意，这里的handle_rebalance是per-consumer的回调
  * @param error
  * @param topic_partitions 会进行全量分配的TopicPartition，而不是增量的TopicPartition
  * @return
