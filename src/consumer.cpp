@@ -87,6 +87,7 @@ Consumer::Consumer(Configuration config)
 
 /**
  * 在析构以前，会调用 moveConsumer() 进行订阅取消的操作，
+ * 由于consumer->unsubscribe()是阻塞的，因此，执行到Consumer::~Consumer()，说明unsubscribe已经成功并且结束了
  * 所以在调用moveConsumer()进行unsubscribe以前还没有清空assignment_callback, revocation_callback和rebalance_error_callback
  */
 Consumer::~Consumer() {
@@ -143,6 +144,9 @@ void Consumer::subscribe(const vector<string>& topics) {
     check_error(error);
 }
 
+/**
+ * unsubscribe是阻塞的，即，如果方法返回，说明unsubscribe成功了
+ */
 void Consumer::unsubscribe() {
     rd_kafka_resp_err_t error = rd_kafka_unsubscribe(get_handle());
     check_error(error);
